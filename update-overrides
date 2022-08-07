@@ -1,0 +1,280 @@
+#! /usr/bin/perl
+
+use strict;
+use warnings;
+
+=head1 NAME
+
+update-overrides
+
+Runs lintian --no-override, parses its output and updates
+C<debian/*lintian-overrides>, including C<debian/source/lintian-overrides>.
+
+=head2 General rules
+
+Attempts to match each emitted overrides with an existing override in the
+lintian-overrides file. "C<*>" wildcards should be supported. It should
+be safe to take a bunch of new overrides for the same warning, for files
+in the same directory, and stick a C<*> on them.
+
+Any unmatched overrides get added to the C<lintian-overrides> file, the
+new overrides are at the beginning of the updated override file.
+
+Existing overrides that do not match any emitted overrides get removed
+from the updated file.
+
+An existing override file gets removed if no warnings get emitted for
+its package.
+
+=head2 Exceptions
+
+All C<W:> messages are parsed. An C<E:> results in a non-0 exit code, and
+an error-level exception does not get processed. It can be be added
+manually to the override file.
+
+A " (line n)" suffix for C<debian/source/lintian-overrides> warnings
+gets stripped and ignored.
+=cut
+
+my %exceptions = ("debian/source/lintian-overrides" => []);
+
+my $packages = IO::File->new("dh_listpackages |");
+
+while (my $package=<$packages>)
+{
+    chomp $package;
+    $exceptions{"debian/$package.lintian-overrides"} = [];
+}
+
+close($packages);
+
+# Run lintian, parse its output.
+
+my $lintian = IO::File->new("lintian --no-override |")
+    or die "Cannot run lintian\n";
+
+my $rc = 0;
+
+while (my $message=<$lintian>)
+{
+    chomp $message;
+
+    # We expect only warning message.
+
+    unless ($message =~ /^([A-Z]):\s+([^:]+):\s+(\S+)(\s+(\S*)(.*))?$/)
+    {
+	print STDERR "$message\n";
+	$rc = 1;
+	next;
+    }
+
+    # Parse each warning message, there's going to be at least a code here.
+
+    my ($level, $package, $code, $path, $other) = ($1,$2,$3,$5,$6);
+
+    unless ($code)
+    {
+	die "Could not parse: $message\n";
+    }
+
+    # There may be a path, following optionally by other info
+    #
+    # If there's other info restore a space that was eaten by the regexp.
+
+    $path //= '';
+    $other //= '';
+
+    $path = " $path" if $path ne "";
+
+    # Figure out the package's name.
+
+    if ($package =~ /\ssource$/)
+    {
+	$package = "debian/source/lintian-overrides";
+	$path = $other = "" if "$path$other" =~ /^\s*\(line\s+\d+\)$/;
+    }
+    else
+    {
+	$package = "debian/$package.lintian-overrides";
+    }
+
+    # And save each exception.
+
+    push @{ $exceptions{$package}}, {
+	prefix => "$code$path",
+	other => $other,
+
+	($level eq 'E' ? (error => $message):()),
+    };
+}
+
+exit 1 if $rc;
+
+foreach my $package (sort keys %exceptions)
+{
+    print "Updating $package\n";
+
+    # If it's a symlink, read what it links to.
+
+    if (-l $package)
+    {
+	my $link = readlink($package)
+	    or die "Cannot read symlink $package\n";
+
+	die "$package symlink cannot contain directories.\n"
+	    if $link =~ m@/@;
+
+	$package =~ s/[^\/]+$//;
+
+	$package .= "/$link";
+    }
+
+    my $existing_overrides = IO::File->new("< $package");
+    my @existing_overrides;
+
+    if ($existing_overrides)
+    {
+	# Current line in the existing lintian-overrides file, begin with
+	# the first line in the file:
+	my $line = <$existing_overrides>;
+
+	while (defined $line)
+	{
+	    # We collect the preceding comment, unparsed.
+
+	    my $existing_override = {
+		comment => "",
+	    };
+
+	    while (defined($line))
+	    {
+		chomp $line;
+
+		if ($line =~ /^#/ ||
+		    !($line =~ /^(\S+)(\s+(\S*)(.*))?$/))
+		{
+		    $existing_override->{comment} .= "$line\n";
+		    $line = <$existing_overrides>;
+		    next;
+		}
+
+		$existing_override->{record} = "$line\n";
+
+		# This looks like an override. Parse it.
+		my ($code, $path, $other) = ($1,$3,$4);
+
+		$path //= '';
+		$other //= '';
+
+		$path = " $path" if $path ne "";
+
+		my $regexp = "$code$path";
+		$existing_override->{prefix} = $regexp;
+
+		$regexp =~ s/([\.\\\(\)])/\\$1/g;
+		$regexp =~ s/\?/./g;
+		$regexp =~ s/\*/.*/g;
+		$regexp = "^" . $regexp . "\$";
+
+		$existing_override->{regexp} = qr/$regexp/;
+		$existing_override->{other} = $other;
+
+		push @existing_overrides, $existing_override;
+		$line = <$existing_overrides>;
+		last;
+	    }
+	}
+    }
+
+    my $new_override = IO::File->new("> $package.tmp")
+	or die "Cannot create $package.tmp\n";
+
+    # Go through the exceptions.
+
+    foreach my $exception (@{$exceptions{$package}})
+    {
+	# The exceptions are sorted in the same order, so we do an
+	# effective merge sort.
+
+	my $prefix = $exception->{prefix};
+	my $other  = $exception->{other};
+
+	my ($existing_override) = grep {
+	    $exception->{prefix} =~ $_->{regexp};
+	} @existing_overrides;
+
+	if ($existing_override)
+	{
+	    $existing_override->{found} = 1;
+	    next;
+	}
+
+	print "    New exception: $package " . $exception->{prefix} . "\n";
+
+	if ($exception->{error})
+	{
+	    print "      " . $exception->{error} . "\n"
+		or die "Cannot update $package.tmp\n";
+	    $rc = 1;
+	}
+	else
+	{
+	    print $new_override "#\n# DOCUMENT ME\n#\n"
+		. $exception->{prefix} . $exception->{other} . "\n"
+		or die "Cannot update $package.tmp\n";
+	}
+    }
+
+    # Now we go back through the existing overrides, and emit the ones that
+    # have been found in the current list of exceptions.
+    #
+    # @existing_overrides is in the order of their appearance in the file,
+    # so each time we see a comment we save it, then emit the comment before
+    # the comment's first override that still exists.
+
+    my $comment = "#\n# DOCUMENT ME\n#\n";
+
+    foreach my $existing_override (@existing_overrides)
+    {
+	if ($existing_override->{comment} ne "")
+	{
+	    $comment = $existing_override->{comment};
+	}
+
+	if ($existing_override->{found})
+	{
+	    print $new_override $comment . $existing_override->{record}
+		or die "Cannot update $package.tmp\n";
+	    $comment = "";
+	}
+	else
+	{
+	    print "    Removed exception: " . $existing_override->{prefix} . "\n";
+	}
+    }
+
+    close($new_override)
+	or die "Cannot update $package.tmp\n";
+
+    if (-s "$package.tmp")
+    {
+	rename("$package.tmp", $package)
+	    or die "Cannot update $package\n";
+    }
+    else
+    {
+	unlink ("$package.tmp");
+	if ( -f $package )
+	{
+	    print "   all exceptions resolved, override file removed.\n";
+	    unlink ($package);
+
+	}
+	else
+	{
+	    print "   no exceptions to override.\n";
+	}
+    }
+}
+
+exit $rc;

@@ -1,0 +1,385 @@
+#! /usr/bin/perl
+
+use strict;
+use warnings;
+use IO::File;
+
+my $release = shift @ARGV;
+my $cmd = shift @ARGV;
+
+my $hooksdir = "/var/cache/pbuilder/hook.d";
+
+unless ($release && $cmd)
+{
+    print STDERR "Usage: $0 [distribution] {command]\n";
+    exit 1;
+}
+
+my $userhome = $ENV{HOME};
+
+if (($cmd eq "-switch") || ($cmd eq "-init"))
+{
+    $userhome = shift @ARGV
+	or die "Invalid invocation.\n";
+}
+
+my $result = $userhome . "/pbuilder/${release}_result";
+
+unless (-f $userhome . "/pbuilder/${release}-base.tgz" && -d $result)
+{
+    print STDERR "$release appears to be incorrect (run pbuilder-dist create first?)\n";
+    exit 1;
+}
+
+sub switch {
+    my $setting_hookdir = "HOOKDIR=\"$hooksdir\"";
+    my $setting_bindmounts = "BINDMOUNTS=\"$result\"";
+    my $settings = <<EOF
+$setting_hookdir
+$setting_bindmounts
+EOF
+    ;
+
+    my $rc = IO::File->new($ENV{HOME} . "/.pbuilderrc", "r");
+
+    if ($rc)
+    {
+	my $line;
+
+	my $orig = "";
+
+	while (defined($line = <$rc>))
+	{
+	    $orig .= $line;
+
+	    if ($line =~ /^HOOKDIR=/)
+	    {
+		chomp $line;
+
+		unless ($line eq $setting_hookdir)
+		{
+		    print STDERR "Existing setting: $line\n";
+		    print STDERR "Cannot update.\n";
+		    exit 1;
+		}
+		next;
+	    }
+
+	    if ($line =~ /^BINDMOUNTS=/)
+	    {
+		chomp $line;
+
+		unless ($line eq $setting_bindmounts)
+		{
+		    print STDERR "Replacing $line\n";
+		}
+		next;
+	    }
+	    $settings .= $line;
+	}
+
+	if ($orig eq $settings)
+	{
+	    return;
+	}
+    }
+
+    $rc = IO::File->new($ENV{HOME} . "/.pbuilderrc.new", "w");
+
+    if ($rc &&
+	chmod(0600, $ENV{HOME} . "/.pbuilderrc.new"))
+    {
+	if (print $rc $settings)
+	{
+	    if (close $rc)
+	    {
+		if (rename($ENV{HOME} . "/.pbuilderrc.new",
+		    $ENV{HOME} . "/.pbuilderrc"))
+		{
+		    print "Updated $ENV{HOME}/.pbuilderrrc for $result\n";
+		    return;
+		}
+	    }
+	}
+    }
+
+    print STDERR "Cannot update $ENV{HOME}/.pbuilderrc\n";
+    exit 1;
+}
+
+if ($cmd eq "-switch")
+{
+    switch();
+
+    unless (-d $hooksdir)
+    {
+	if (!mkdir($hooksdir, 0755))
+	{
+	    print STDERR "Cannot create $hooksdir\n";
+	    exit(1);
+	}
+    }
+
+    my $hook = <<EOF
+#
+set -e
+cd $result
+eval `/usr/bin/dpkg-architecture`
+rm -rf dists
+mkdir -p dists/$release/main/binary-\$DEB_TARGET_ARCH
+/usr/bin/dpkg-scanpackages . /dev/null >dists/$release/main/binary-\$DEB_TARGET_ARCH/Packages
+/usr/bin/apt-get update
+if test -f AUTO_INSTALL
+then
+	/usr/bin/apt-get -y --allow-downgrades install `cat AUTO_INSTALL`
+fi
+
+if test -f LOCALES
+then
+	for locale in `cat LOCALES`
+	do
+		locale-gen \$locale
+	done
+	update-locale
+fi
+
+if test -f preferences
+then
+	cp preferences /etc/apt/preferences
+else
+	rm -f /etc/apt/preferences
+fi
+EOF
+	;
+
+    my $oldhook = "";
+
+    foreach my $cache (
+	$hooksdir . "/D70pbuilder-dist-extras",
+	$hooksdir . "/F70pbuilder-dist-extras",
+	)
+    {
+	my $rc = IO::File->new($cache, "r");
+
+	if ($rc)
+	{
+	    $oldhook = join("", <$rc>);
+	    close($rc);
+	}
+
+	if ($hook eq $oldhook)
+	{
+	    next;
+	}
+
+	$rc = IO::File->new($cache, "w");
+
+	if ($rc && chmod(0755, $cache))
+	{
+	    if (print $rc $hook)
+	    {
+		if (close($rc))
+		{
+		    print STDERR "Switched $cache to $result\n";
+		    next;
+		}
+	    }
+	}
+
+	print STDERR "Cannot update $cache\n";
+	exit 1;
+    }
+    exit (0)
+}
+
+switch;
+
+if (system("sudo", $0, $release, "-switch", $ENV{HOME}) != 0)
+{
+    exit(1);
+}
+
+sub update_file {
+    my ($f) = @_;
+
+    my %entries;
+
+    my $fh = IO::File->new($result . "/$f", "r");
+
+    if ($fh)
+    {
+	while (defined(my $pkg = <$fh>))
+	{
+	    chomp $pkg;
+	    $entries{$pkg} = 1;
+	}
+	close($fh);
+    }
+
+    foreach my $pkg (@ARGV)
+    {
+	if ($pkg =~ s/^-//)
+	{
+	    delete $entries{$pkg};
+	}
+	else
+	{
+	    $pkg =~ s/^\+//;
+	    $entries{$pkg} = 1;
+	}
+    }
+    if (%entries)
+    {
+	my $fh = IO::File->new($result . "/$f", "w");
+
+	unless ($fh)
+	{
+	    print STDERR "Cannot create the $f file\n";
+	    exit(1);
+	}
+
+	if (!(print $fh join("\n", sort keys %entries) . "\n") ||
+	    !close($fh))
+	{
+	    print STDERR "Cannot update the $f file\n";
+	    exit(1);
+	}
+
+	print "The following entries will be installed:\n";
+	print "    $_\n"
+	    for sort keys %entries;
+    }
+    else
+    {
+	unlink($result . "/$f");
+	print "No extra entries will be installed.\n";
+    }
+}
+
+if ($cmd eq "use")
+{
+    update_file("AUTO_INSTALL");
+    exit(0);
+}
+
+if ($cmd eq "locale")
+{
+    update_file("LOCALES");
+    exit(0);
+}
+
+if ($cmd eq "clean")
+{
+    foreach my $pat (
+	"build",
+	"buildinfo",
+	"bz2",
+	"changes",
+	"ddeb",
+	"deb",
+	"dsc",
+	"log",
+	"xz",
+	)
+    {
+	foreach my $f (glob("$result/*.$pat"))
+	{
+	    unlink($f);
+	}
+    }
+    exit(0);
+}
+
+my @options;
+
+if ($cmd ne "update")
+{
+    @options = (
+	"--othermirror",
+	"deb [trusted=yes] file://$result $release main",
+	);
+}
+
+exec("pbuilder-dist", $release, $cmd, "--override-config", @options, @ARGV);
+exit(1);
+
+=pod
+
+=head1 NAME
+
+pde-local - pbuilder-dist helper for builds with additional local dependencies
+
+=head2 USAGE
+
+    pbuilder-dist [dist] create
+
+    pde-local [dist] build package.dsc...
+
+=head2 DESCRIPTION
+
+C<pde-local> is a wrapper for C<pbuilder-dist> that automates the workflow
+of using pbuilder-dist to incrementally build mutually-dependent packages
+that are not a part of a distribution. A local repository gets automatically
+set up and added to the build root. Each built package gets added to the
+local repository and becomes available as a build dependency of the next
+package. This workflow makes it possible to bootstrap a series of packages that
+have mutual dependencies.
+
+This workflow begins by using C<pbuilder-dist [dist] create> to create the
+buildroot image. This documentation uses the label C<[dist]> as a placeholder
+for pbuilder-dist's "distribution" label.
+
+C<pde-local> implements all commands described below by itself, and then
+forwards all other commands to C<pbuilder-dist> after:
+
+* Updating both C<~/.pbuilderrc> and C</root/.builderrc>, if needed
+
+* Updating its hooks in C</var/cache/pbuilder/hook.d>
+
+C<pde-local> peeks at the C<[dist]> suite label, and uses it to update the
+configuration file and the hook scripts accordingly.
+
+C<pde-local>'s changes have the effect of running C<pbuilder-dist> with
+an extra source repository added to C<sources.list> in the build root.
+C<pde-local [dist] build [filename].dsc> runs C<pbuilder-dist> with the
+same parameters. If all goes well the resulting binary and source packages
+get written into C<~/pbuilder/[dist]_results> which also happens to be
+exactly where the extra source repository lives.
+
+The C<clean> command (see below) removes all built packages from the
+ build root.
+
+=head2 HOOKS
+
+C<pde-local> installs C<D> and C<F> hooks (see C<man pbuilder>) that adjust
+the build root for the C<build> and C<login/execute> pbuilder commands.
+The following commands adjust the build root:
+
+    pde-local [dist] use package1 package2...
+
+    pde-local [dist] use -package1...
+
+The C<use> command updates the list of packages that get installed by
+C<apt install> in the build root. Each C<use> command adds the listed
+packages to the installation list. Prepend a package name with a dash
+to remove it from the list.
+
+NOTE: the packages get installed with C<-y --allow-downgrades> flags.
+
+    pde-local [dist] locale en_US.UTF-8
+
+    pde-local [dist] locale -en_US.UTF-8
+
+Adds/removes a locale from the buildroot. This requires the "locales"
+package, use C<pde-local [dist] use locales> to add it to the build root.
+
+    pde-local [dist] clean
+
+=head2 OTHER FILES
+
+    ~/pbuilder/[dist]_results/preferences
+
+If this file exists it gets installed as /etc/apt/preferences in the
+build root.
+
+=cut
