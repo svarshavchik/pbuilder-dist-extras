@@ -120,7 +120,7 @@ if ($cmd eq "-switch")
 	}
     }
 
-    my $hook = <<EOF
+    my $package_hook = <<EOF
 #
 set -e
 cd $result
@@ -128,6 +128,18 @@ eval `/usr/bin/dpkg-architecture`
 rm -rf dists
 mkdir -p dists/$release/main/binary-\$DEB_TARGET_ARCH
 /usr/bin/dpkg-scanpackages . /dev/null >dists/$release/main/binary-\$DEB_TARGET_ARCH/Packages
+EOF
+	;
+    my $setup_hook = <<EOF
+#
+set -e
+cd $result
+eval `/usr/bin/dpkg-architecture`
+if test ! -f dists/$release/main/binary-\$DEB_TARGET_ARCH/Packages
+then
+	mkdir -p dists/$release/main/binary-\$DEB_TARGET_ARCH
+	>dists/$release/main/binary-\$DEB_TARGET_ARCH/Packages
+fi
 /usr/bin/apt-get update
 if test -f AUTO_INSTALL
 then
@@ -152,13 +164,25 @@ fi
 EOF
 	;
 
-    my $oldhook = "";
+    my %all_hooks = (
+	$hooksdir . "/I70pbuilder-dist-extras" => $package_hook,
+	$hooksdir . "/D70pbuilder-dist-extras" => $setup_hook,
+	$hooksdir . "/F70pbuilder-dist-extras" => $setup_hook,
+	);
 
-    foreach my $cache (
-	$hooksdir . "/D70pbuilder-dist-extras",
-	$hooksdir . "/F70pbuilder-dist-extras",
-	)
+    foreach my $existing_hook (
+	sort glob ($hooksdir . "/*pbuilder-dist-extras"))
     {
+	next unless -f $existing_hook;
+
+	next if grep {$existing_hook eq $_} keys %all_hooks;
+	unlink($existing_hook);
+    }
+
+    foreach my $cache (sort keys %all_hooks)
+    {
+	my $oldhook = "";
+
 	my $rc = IO::File->new($cache, "r");
 
 	if ($rc)
@@ -167,7 +191,7 @@ EOF
 	    close($rc);
 	}
 
-	if ($hook eq $oldhook)
+	if ($all_hooks{$cache} eq $oldhook)
 	{
 	    next;
 	}
@@ -176,7 +200,7 @@ EOF
 
 	if ($rc && chmod(0755, $cache))
 	{
-	    if (print $rc $hook)
+	    if (print $rc $all_hooks{$cache})
 	    {
 		if (close($rc))
 		{
@@ -190,6 +214,220 @@ EOF
 	exit 1;
     }
     exit (0)
+}
+
+if ($cmd eq 'aptly')
+{
+    my $repo = "mine-$release";
+    my $force = 0;
+
+    if (@ARGV && $ARGV[0] !~ /^-/)
+    {
+	$repo = shift @ARGV;
+    }
+
+    while (@ARGV)
+    {
+	my $opt = shift @ARGV;
+
+	if ($opt eq '-force')
+	{
+	    $force = 1;
+	    next;
+	}
+
+	print STDERR "Usage: $0 [distribution] aptly [repo [-force]]\n";
+	exit(1);
+    }
+
+    my $fh = IO::File->new("/usr/bin/dpkg-architecture |");
+
+    my $arch;
+
+    while (<$fh>)
+    {
+	chomp;
+
+	$arch = $1 if /^DEB_TARGET_ARCH=(.*)/;
+    }
+
+    unless ($arch)
+    {
+	print STDERR "Unable to determine architecture\n";
+	exit(1);
+    }
+
+    $fh = IO::File->new($result . "/dists/$release/main/binary-$arch/Packages",
+	"r");
+
+    unless ($fh)
+    {
+	print STDERR "Cannot open $result/dists/$release/main/binary-$arch/Packages\n";
+	exit(1);
+    }
+
+    my @dist_packages;
+
+    while (<$fh>)
+    {
+	chomp;
+
+	push @dist_packages, "$result/$1"
+	    if /^Filename:\s*(.*)/;
+    }
+
+    unless (@dist_packages)
+    {
+	print STDERR "No packages found in $result/dists/$release/main/binary-$arch/Packages\n";
+	exit(1);
+    }
+
+    my $found_repo = 0;
+
+    $fh = IO::File->new("aptly repo list -raw |");
+    while (<$fh>)
+    {
+	chomp;
+
+	if ($_ eq $repo)
+	{
+	    if (! $force)
+	    {
+		print STDERR "aptly repo $repo already exists.\n";
+		exit(1);
+	    }
+	    $found_repo = 1;
+	}
+    }
+
+    if (! $found_repo)
+    {
+	system("aptly", "repo", "create", $repo) == 0
+	    || exit(1);
+    }
+
+    $fh = IO::File->new;
+
+    open($fh, "-|", "aptly", "repo", "search", $repo);
+
+    my @existing_packages = <$fh>;
+    chomp $_ for @existing_packages;
+
+    my %existing_packages = map { ($_ => 1) } @existing_packages;
+
+    my %current_packages;
+
+    foreach my $file (@dist_packages)
+    {
+	my $basename = $file;
+
+	$basename =~ s@.*/@@;
+
+	$current_packages{$basename} = $file;
+    }
+
+    foreach my $existing_package (sort keys %existing_packages)
+    {
+	next if $current_packages{$existing_package . ".deb"};
+
+	system("aptly", "repo", "remove", $repo, $existing_package) == 0
+	    || exit 1
+    }
+
+    foreach my $file (sort keys %current_packages)
+    {
+	my $no_suffix = $file;
+
+	$no_suffix =~ s@\.deb$@@;
+
+	next if $existing_packages{$no_suffix};
+
+	system("aptly", "repo", "add", "-force-replace", $repo, $current_packages{$file}) == 0
+	    || exit 1;
+    }
+
+    my $create_new;
+    my $counter = 0;
+
+    do
+    {
+	if (++$counter > 2)
+	{
+	    print STDERR "Cannot update local repo\n";
+	    exit(1);
+	}
+
+	my $snapshot_fh = IO::File->new("aptly snapshot list -raw |");
+
+	my %snapshots;
+
+	while (<$snapshot_fh>)
+	{
+	    chomp;
+	    $snapshots{$_} = 1;
+	}
+	close($snapshot_fh);
+
+	my %published;
+
+	$snapshot_fh = IO::File->new("aptly publish list -raw |");
+	while (<$snapshot_fh>)
+	{
+	    chomp;
+	    my ($dir, $published) = split(/\s+/);
+
+	    $published{$published} = 1;
+	}
+	close($snapshot_fh);
+
+	$create_new = 1;
+
+	if ($snapshots{"${repo}-new"})
+	{
+	    print "Attempting to remove incomplete snapshot ${repo}-new\n";
+	    if (system("aptly", "snapshot", "drop", "${repo}-new") != 0)
+	    {
+		$create_new = 0;
+	    }
+	}
+
+	if ($create_new)
+	{
+	    system("aptly", "snapshot", "create", "${repo}-new",
+		"from", "repo", $repo) == 0
+		or exit 1;
+
+	    if ($published{$release})
+	    {
+		print "Switching $repo\n";
+
+		system("aptly", "publish", "switch",
+		    $release, "${repo}-new") == 0
+		    or exit 1
+	    }
+	    else
+	    {
+		print "Publishing $repo\n";
+
+		system("aptly", "publish", "snapshot",
+		    "-distribution=$release", "${repo}-new") == 0
+		    or exit 1
+	    }
+	}
+
+	if ($snapshots{$repo})
+	{
+	    system("aptly", "snapshot", "drop", $repo) == 0
+		or exit 1
+	}
+
+	system("aptly", "snapshot", "rename", "${repo}-new", $repo) == 0
+	    or exit 1;
+    } while (! $create_new );
+
+    system("aptly", "db", "cleanup") == 0 or exit 1;
+
+    exit 0;
 }
 
 switch;
@@ -351,8 +589,8 @@ The C<clean> command (see below) removes all built packages from the
 
 =head2 HOOKS
 
-C<pde-local> installs C<D> and C<F> hooks (see C<man pbuilder>) that adjust
-the build root for the C<build> and C<login/execute> pbuilder commands.
+C<pde-local> installs C<I>, C<D> and C<F> hooks (see C<man pbuilder>) that
+ adjust the build root for the C<build> and C<login/execute> pbuilder commands.
 The following commands adjust the build root:
 
     pde-local [dist] use package1 package2...
@@ -374,6 +612,24 @@ Adds/removes a locale from the buildroot. This requires the "locales"
 package, use C<pde-local [dist] use locales> to add it to the build root.
 
     pde-local [dist] clean
+
+The C<clean> command deletes all built deb files from the result directory.
+At this time, the hook that updates the extra source repository does not
+get run, and the repository is in a temporary bad state until the first
+package gets built again.
+
+=head2 PUSHING TO AN APTLY REPOSITORY
+
+    pde-local [dist] aptly [name -force]
+
+The C<aptly> command pushes all built deb files from the build root's extra
+source repository to aptly and publishes it.
+
+C<aptly> creates an aptly repository named C<[name]>. Pass an additional
+C<-force> option to automatically delete any existing aptly repository
+with that name. Afterwards the C<aptly> command creates a named snapshot
+called C<[name]> (using a temporary, transitional C<[name]-new> snapshot)
+and publishes it.
 
 =head2 OTHER FILES
 
