@@ -31,6 +31,10 @@ unless (-f $userhome . "/pbuilder/${release}-base.tgz" && -d $result)
     exit 1;
 }
 
+# Install a .pbuilderrc file with HOOKSDIR and BINDMOUTNS settings
+#
+# This is used for both the build userid, and root.
+
 sub switch {
     my $setting_hookdir = "HOOKDIR=\"$hooksdir\"";
     my $setting_bindmounts = "BINDMOUNTS=\"$result\"";
@@ -39,6 +43,12 @@ $setting_hookdir
 $setting_bindmounts
 EOF
     ;
+
+    # Parse the existing .pbuilderrc if there is one.
+    #
+    # Make sure we won't clobber any custom settings.
+    #
+    # Add any other settings to $settings
 
     my $rc = IO::File->new($ENV{HOME} . "/.pbuilderrc", "r");
 
@@ -109,6 +119,8 @@ EOF
 
 if ($cmd eq "-switch")
 {
+    # Set up root's pbuilder configuration
+
     switch();
 
     unless (-d $hooksdir)
@@ -120,6 +132,11 @@ if ($cmd eq "-switch")
 	}
     }
 
+    # pbuilder hooks, see pbuilder(8)
+
+    # I-hook. After a build update the Packages file of the pbuilder's
+    # repository.
+
     my $package_hook = <<EOF
 #
 set -e
@@ -130,6 +147,16 @@ mkdir -p dists/$release/main/binary-\$DEB_TARGET_ARCH
 /usr/bin/dpkg-scanpackages . /dev/null >dists/$release/main/binary-\$DEB_TARGET_ARCH/Packages
 EOF
 	;
+
+    # D/F hook. Before unpacking the package to build, or for the login or
+    # execute command, set up the custom pbuilder root. If the Packages file
+    # does not exist create an empty one. pde-local executes pbuilder-dist
+    # with --othermirror pointing to this internal mirror.
+    #
+    # The script also reads AUTO_INSTALL, and installs each package there,
+    # reads LOCALES, and installs any locales, and installs a custom
+    # /etc/apt/preferences, if needed.
+
     my $setup_hook = <<EOF
 #
 set -e
@@ -257,6 +284,8 @@ if ($cmd eq 'aptly')
 	exit(1);
     }
 
+    # Parse the list of packages in the pbuilder's repo.
+
     $fh = IO::File->new($result . "/dists/$release/main/binary-$arch/Packages",
 	"r");
 
@@ -282,6 +311,8 @@ if ($cmd eq 'aptly')
 	exit(1);
     }
 
+    # Check if the aptly repo already exists, or create it.
+
     my $found_repo = 0;
 
     $fh = IO::File->new("aptly repo list -raw |");
@@ -306,6 +337,8 @@ if ($cmd eq 'aptly')
 	    || exit(1);
     }
 
+    # Retrieve the list of packages in the aptly repo.
+
     $fh = IO::File->new;
 
     open($fh, "-|", "aptly", "repo", "search", $repo);
@@ -326,6 +359,10 @@ if ($cmd eq 'aptly')
 	$current_packages{$basename} = $file;
     }
 
+    # aptly search output lists the packages without the .deb suffix.
+    #
+    # Check if the pbuilder-dist repo has the package, if not remove it
+    # from the aptly repo.
     foreach my $existing_package (sort keys %existing_packages)
     {
 	next if $current_packages{$existing_package . ".deb"};
@@ -334,6 +371,8 @@ if ($cmd eq 'aptly')
 	    || exit 1
     }
 
+    # Now go through the pbuilder repo's packages, and add them to the
+    # aptly repo if they do not exist there.
     foreach my $file (sort keys %current_packages)
     {
 	my $no_suffix = $file;
@@ -346,6 +385,8 @@ if ($cmd eq 'aptly')
 	    || exit 1;
     }
 
+    # Attempt to push out a new aptly snapshot.
+
     my $create_new;
     my $counter = 0;
 
@@ -356,6 +397,8 @@ if ($cmd eq 'aptly')
 	    print STDERR "Cannot update local repo\n";
 	    exit(1);
 	}
+
+	# Retrieve a list of snapshots and published snapshots.
 
 	my $snapshot_fh = IO::File->new("aptly snapshot list -raw |");
 
@@ -380,6 +423,10 @@ if ($cmd eq 'aptly')
 	}
 	close($snapshot_fh);
 
+	# If the -new snapshot exist attempt to drop it. If it won't
+	# drop it must be published already, and after cleaning up we'll
+	# try again.
+
 	$create_new = 1;
 
 	if ($snapshots{"${repo}-new"})
@@ -393,9 +440,14 @@ if ($cmd eq 'aptly')
 
 	if ($create_new)
 	{
+	    # Create a new snapshot
+
 	    system("aptly", "snapshot", "create", "${repo}-new",
 		"from", "repo", $repo) == 0
 		or exit 1;
+
+	    # If there's an existing published snapshot switch the new snapshot
+	    # to it.
 
 	    if ($published{$release})
 	    {
@@ -407,6 +459,8 @@ if ($cmd eq 'aptly')
 	    }
 	    else
 	    {
+		# First published snapshot.
+
 		print "Publishing $repo\n";
 
 		system("aptly", "publish", "snapshot",
@@ -415,11 +469,15 @@ if ($cmd eq 'aptly')
 	    }
 	}
 
+	# Drop the old snapshot
+
 	if ($snapshots{$repo})
 	{
 	    system("aptly", "snapshot", "drop", $repo) == 0
 		or exit 1
 	}
+
+	# And rename the new snapshot to the current one.
 
 	system("aptly", "snapshot", "rename", "${repo}-new", $repo) == 0
 	    or exit 1;
@@ -430,6 +488,8 @@ if ($cmd eq 'aptly')
     exit 0;
 }
 
+# Update our .pbuilderrc and the root's.
+
 switch;
 
 if (system("sudo", $0, $release, "-switch", $ENV{HOME}) != 0)
@@ -437,8 +497,12 @@ if (system("sudo", $0, $release, "-switch", $ENV{HOME}) != 0)
     exit(1);
 }
 
+# Common logic for updating AUTO_INSTALL and LOCALE lists.
+
 sub update_file {
     my ($f) = @_;
+
+    # Read the existing contents of the file
 
     my %entries;
 
@@ -454,6 +518,8 @@ sub update_file {
 	close($fh);
     }
 
+    # Apply the updates.
+
     foreach my $pkg (@ARGV)
     {
 	if ($pkg =~ s/^-//)
@@ -466,6 +532,8 @@ sub update_file {
 	    $entries{$pkg} = 1;
 	}
     }
+
+    # Save new file.
     if (%entries)
     {
 	my $fh = IO::File->new($result . "/$f", "w");
