@@ -2,6 +2,7 @@
 
 use strict;
 use warnings;
+use Getopt::Long;
 
 =head1 NAME
 
@@ -34,7 +35,47 @@ manually to the override file.
 
 A " (line n)" suffix for C<debian/source/lintian-overrides> warnings
 gets stripped and ignored.
+
+=head2 Symbolic links
+
+C<debian/*lintian-overrides> symbolic links get handled as follows:
+
+- the symbolic link must point to another file in the same directory.
+
+- the symbolic link target is ignored for the purposes of reconciling the
+list of overrides, instead the symbolic link's name gets reconciled with
+lintian's output.
+
+- any override updates, however, get applied to the symbolic link's
+target.
+
+This allows for a workflow that minimizes the effects of shared library
+version bumps:
+
+- C<debian/packageN.lintian-override> is a symbolic link to
+C<debian/package.soname.lintian-override>.
+
+- a shared version bump moves the symbolic link, to
+C<debian/packageN+1.lintian-override>, for example.
+
+- the underlying list of overrides is kept, and tracked, in
+C<debian/package.soname.lintian-override>.
+
 =cut
+
+my $dry_run;
+my $usage;
+
+GetOptions(
+    "dry-run" => \$dry_run,
+    "usage" => \$usage
+    ) or die "Error in command line arguments.\n";
+
+if ($usage)
+{
+    print "Usage: $0 [--dry-run]\n";
+    exit 0;
+}
 
 my %exceptions = ("debian/source/lintian-overrides" => []);
 
@@ -84,6 +125,14 @@ while (my $message=<$lintian>)
     $path //= '';
     $other //= '';
 
+    my $opt_context;
+
+    if ($path =~ /^\[.*\]$/)
+    {
+	$opt_context = $path;
+	$path='';
+    }
+
     $path = " $path" if $path ne "";
 
     # Figure out the package's name.
@@ -103,7 +152,7 @@ while (my $message=<$lintian>)
     push @{ $exceptions{$package}}, {
 	prefix => "$code$path",
 	other => $other,
-
+	opt_context => $opt_context,
 	($level eq 'E' ? (error => $message):()),
     };
 }
@@ -116,6 +165,11 @@ foreach my $package (sort keys %exceptions)
 
     # If it's a symlink, read what it links to.
 
+    # Keep both the original name, and the target, in case we decide to
+    # remove it.
+
+    my @orig_name = ($package);
+
     if (-l $package)
     {
 	my $link = readlink($package)
@@ -124,9 +178,13 @@ foreach my $package (sort keys %exceptions)
 	die "$package symlink cannot contain directories.\n"
 	    if $link =~ m@/@;
 
-	$package =~ s/[^\/]+$//;
+	my $base = $package;
 
-	$package .= "/$link";
+	$base =~ s/[^\/]+$//;
+
+	$base .= $link;
+
+	push @orig_name, $base;
     }
 
     my $existing_overrides = IO::File->new("< $package");
@@ -166,6 +224,14 @@ foreach my $package (sort keys %exceptions)
 		$path //= '';
 		$other //= '';
 
+		my $opt_context;
+
+		if ($path =~ /^\[.*\]$/)
+		{
+		    $opt_context = $path;
+		    $path='';
+		}
+
 		$path = " $path" if $path ne "";
 
 		my $regexp = "$code$path";
@@ -174,10 +240,13 @@ foreach my $package (sort keys %exceptions)
 		$regexp =~ s/([\.\\\(\)])/\\$1/g;
 		$regexp =~ s/\?/./g;
 		$regexp =~ s/\*/.*/g;
+		$regexp =~ s/\[/\\[/g;
+		$regexp =~ s/\]/\\]/g;
 		$regexp = "^" . $regexp . "\$";
 
 		$existing_override->{regexp} = qr/$regexp/;
 		$existing_override->{other} = $other;
+		$existing_override->{opt_context} = $opt_context;
 
 		push @existing_overrides, $existing_override;
 		$line = <$existing_overrides>;
@@ -200,7 +269,10 @@ foreach my $package (sort keys %exceptions)
 	my $other  = $exception->{other};
 
 	my ($existing_override) = grep {
-	    $exception->{prefix} =~ $_->{regexp};
+	    $exception->{prefix} =~ $_->{regexp} &&
+		(!defined $_->{opt_context} ||
+		    (defined $exception->{opt_context} &&
+			$exception->{opt_context} eq $_->{opt_context}));
 	} @existing_overrides;
 
 	if ($existing_override)
@@ -220,7 +292,10 @@ foreach my $package (sort keys %exceptions)
 	else
 	{
 	    print $new_override "#\n# DOCUMENT ME\n#\n"
-		. $exception->{prefix} . $exception->{other} . "\n"
+		. $exception->{prefix} . $exception->{other}
+	    . (defined $exception->{opt_context} ?
+		" " . $exception->{opt_context}:"")
+	    . "\n"
 		or die "Cannot update $package.tmp\n";
 	}
     }
@@ -258,8 +333,15 @@ foreach my $package (sort keys %exceptions)
 
     if (-s "$package.tmp")
     {
-	rename("$package.tmp", $package)
-	    or die "Cannot update $package\n";
+	if ($dry_run)
+	{
+	    unlink("$package.tmp");
+	}
+	else
+	{
+	    rename("$package.tmp", $orig_name[-1])
+		or die "Cannot update $package\n";
+	}
     }
     else
     {
@@ -267,8 +349,12 @@ foreach my $package (sort keys %exceptions)
 	if ( -f $package )
 	{
 	    print "   all exceptions resolved, override file removed.\n";
-	    unlink ($package);
 
+	    if (! $dry_run)
+	    {
+		unlink ($_)
+		    for @orig_name;
+	    }
 	}
 	else
 	{
