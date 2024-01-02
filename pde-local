@@ -602,7 +602,9 @@ if ($cmd ne "update")
 {
     @options = (
 	"--othermirror",
-	"deb [trusted=yes] file://$result $release main",
+	"deb [trusted=yes] file://$result $release main|"
+	. "deb http://archive.ubuntu.com/ubuntu $release-updates main restricted universe multiverse|"
+	. "deb http://archive.ubuntu.com/ubuntu $release-backports main restricted universe multiverse"
 	);
 }
 
@@ -651,6 +653,8 @@ C<pde-local [dist] build [filename].dsc> runs C<pbuilder-dist> with the
 same parameters. If all goes well the resulting binary and source packages
 get written into C<~/pbuilder/[dist]_results> which also happens to be
 exactly where the extra source repository lives.
+C<pde-local> also adds the C<[dist]-updates> and C<[dist]-backports> to the
+build root's C<sources.list>.
 
 The C<clean> command (see below) removes all built packages from the
  build root.
