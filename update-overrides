@@ -36,6 +36,14 @@ manually to the override file.
 A " (line n)" suffix for C<debian/source/lintian-overrides> warnings
 gets stripped and ignored.
 
+The C<debian/lintian-overrides.allow-errors> file, if it exists, lists any
+errors that get ignored, they get processed as warnings. Example:
+
+  custom-library-search-path
+  non-standard-dir-in-var
+
+These two exceptions will be processed as warnings.
+
 =head2 Symbolic links
 
 C<debian/*lintian-overrides> symbolic links get handled as follows:
@@ -91,10 +99,25 @@ close($packages);
 
 # Run lintian, parse its output.
 
-my $lintian = IO::File->new("lintian --no-override |")
+my $lintian = IO::File->new("lintian --no-override --no-tag-display-limit |")
     or die "Cannot run lintian\n";
 
 my $rc = 0;
+
+my %allow_errors;
+
+my $allow_errors = IO::File->new("<debian/lintian-overrides.allow-errors");
+my %ignore_errors;
+
+if ($allow_errors)
+{
+    while (defined (my $l=<$allow_errors>))
+    {
+	chomp $l;
+	$ignore_errors{$l} = 1;
+    }
+    close($allow_errors);
+}
 
 while (my $message=<$lintian>)
 {
@@ -149,12 +172,14 @@ while (my $message=<$lintian>)
 
     # And save each exception.
 
+    $level = "" if $ignore_errors{$code};
+
     push @{ $exceptions{$package}}, {
 	prefix => "$code$path",
 	other => $other,
 	opt_context => $opt_context,
 	($level eq 'E' ? (error => $message):()),
-    };
+    } if exists $exceptions{$package};
 }
 
 exit 1 if $rc;
