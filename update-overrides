@@ -141,6 +141,10 @@ while (my $message=<$lintian>)
 	die "Could not parse: $message\n";
     }
 
+    if ($code eq 'mismatched-override')
+    {
+	next;
+    }
     # There may be a path, following optionally by other info
     #
     # If there's other info restore a space that was eaten by the regexp.
