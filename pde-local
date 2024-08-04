@@ -22,8 +22,99 @@ if (($cmd eq "-switch") || ($cmd eq "-init"))
     $userhome = shift @ARGV
 	or die "Invalid invocation.\n";
 }
-
 my $result = $userhome . "/pbuilder/${release}_result";
+
+if ($cmd eq 'unhook' || $cmd eq "-unhook")
+{
+    my $rc = IO::File->new($ENV{HOME} . "/.pbuilderrc", "r");
+
+    my $settings = "";
+    my $orig = "";
+
+    if ($rc)
+    {
+	my $line;
+
+	my $setting_hookdir = "HOOKDIR=\"$hooksdir\"";
+	my $setting_bindmounts = "BINDMOUNTS=\"$result\"";
+
+	while (defined($line = <$rc>))
+	{
+	    $orig .= $line;
+
+	    if ($line =~ /^HOOKDIR=/)
+	    {
+		chomp $line;
+
+		unless ($line eq $setting_hookdir)
+		{
+		    print STDERR "Existing setting: $line\n";
+		    print STDERR "Cannot update.\n";
+		    exit 1;
+		}
+		next;
+	    }
+
+	    if ($line =~ /^BINDMOUNTS=/)
+	    {
+		chomp $line;
+
+		unless ($line eq $setting_bindmounts)
+		{
+		    print STDERR "Replacing $line\n";
+		}
+		next;
+	    }
+	    $settings .= $line;
+	}
+    }
+
+    if ($orig ne $settings)
+    {
+	$rc = IO::File->new($ENV{HOME} . "/.pbuilderrc.new", "w");
+
+	if ($rc &&
+	    chmod(0600, $ENV{HOME} . "/.pbuilderrc.new"))
+	{
+	    if (print $rc $settings)
+	    {
+		if (close $rc)
+		{
+		    if (rename($ENV{HOME} . "/.pbuilderrc.new",
+			$ENV{HOME} . "/.pbuilderrc"))
+		    {
+			print "Removed hooks from $ENV{HOME}/.pbuilderrrc\n";
+			exit(1);
+		    }
+		}
+	    }
+	}
+    }
+}
+
+if ($cmd eq "unhook")
+{
+    if (system("sudo", $0, $release, "-unhook", $ENV{HOME}) != 0)
+    {
+	exit(1);
+    }
+
+    exit(0);
+}
+
+if ($cmd eq '-unhook')
+{
+    my $fh = IO::File->new;
+
+    opendir($fh, $hooksdir) || die "$hooksdir: $!\n";
+
+    foreach my $hook (grep(/pbuilder-dist-extras$/, readdir($fh)))
+    {
+	unlink("$hooksdir/$hook");
+    }
+    close($fh);
+    exit(0);
+}
 
 unless (-f $userhome . "/pbuilder/${release}-base.tgz" && -d $result)
 {
@@ -658,6 +749,11 @@ build root's C<sources.list>.
 
 The C<clean> command (see below) removes all built packages from the
  build root.
+
+    pde-local [dist] unhook
+
+The C<unhook> command has the effect of removing the hooks and undoing
+the above changes to the C<.pbuilderrc> files.
 
 =head2 HOOKS
 
