@@ -99,7 +99,7 @@ close($packages);
 
 # Run lintian, parse its output.
 
-my $lintian = IO::File->new("lintian --no-override --no-tag-display-limit |")
+my $lintian = IO::File->new("lintian --no-override --tag-display-limit 0 |")
     or die "Cannot run lintian\n";
 
 my $rc = 0;
@@ -125,7 +125,14 @@ while (my $message=<$lintian>)
 
     # We expect only warning message.
 
-    unless ($message =~ /^([A-Z]):\s+([^:]+):\s+(\S+)(\s+(\S*)(.*))?$/)
+    unless ($message =~ /^
+		     ([A-Z]):
+			\s+
+		     ([^:]+)
+			:\s+
+		     (\S+)
+		     (\s+\S.*)?$
+				/xx)
     {
 	print STDERR "$message\n";
 	$rc = 1;
@@ -134,7 +141,7 @@ while (my $message=<$lintian>)
 
     # Parse each warning message, there's going to be at least a code here.
 
-    my ($level, $package, $code, $path, $other) = ($1,$2,$3,$5,$6);
+    my ($level, $package, $code, $path) = ($1,$2,$3,$4);
 
     unless ($code)
     {
@@ -145,20 +152,10 @@ while (my $message=<$lintian>)
     {
 	next;
     }
-    # There may be a path, following optionally by other info
-    #
-    # If there's other info restore a space that was eaten by the regexp.
 
     $path //= '';
-    $other //= '';
-
-    my $opt_context;
-
-    if ($path =~ /^\[.*\]$/)
-    {
-	$opt_context = $path;
-	$path='';
-    }
+    $path =~ s/^\s+//;
+    $path =~ s/\s+$//;
 
     $path = " $path" if $path ne "";
 
@@ -167,7 +164,7 @@ while (my $message=<$lintian>)
     if ($package =~ /\ssource$/)
     {
 	$package = "debian/source/lintian-overrides";
-	$path = $other = "" if "$path$other" =~ /^\s*\(line\s+\d+\)$/;
+	$path = "" if $path =~ /^\s*\(line\s+\d+\)$/;
     }
     else
     {
@@ -180,8 +177,6 @@ while (my $message=<$lintian>)
 
     push @{ $exceptions{$package}}, {
 	prefix => "$code$path",
-	other => $other,
-	opt_context => $opt_context,
 	($level eq 'E' ? (error => $message):()),
     } if exists $exceptions{$package};
 }
@@ -238,7 +233,7 @@ foreach my $package (sort keys %exceptions)
 		chomp $line;
 
 		if ($line =~ /^#/ ||
-		    !($line =~ /^(\S+)(\s+(\S*)(.*))?$/))
+		    !($line =~ /^(\S+)(\s+(\S.*))?$/))
 		{
 		    $existing_override->{comment} .= "$line\n";
 		    $line = <$existing_overrides>;
@@ -248,19 +243,9 @@ foreach my $package (sort keys %exceptions)
 		$existing_override->{record} = "$line\n";
 
 		# This looks like an override. Parse it.
-		my ($code, $path, $other) = ($1,$3,$4);
+		my ($code, $path) = ($1, $3);
 
 		$path //= '';
-		$other //= '';
-
-		my $opt_context;
-
-		if ($path =~ /^\[.*\]$/)
-		{
-		    $opt_context = $path;
-		    $path='';
-		}
-
 		$path = " $path" if $path ne "";
 
 		my $regexp = "$code$path";
@@ -274,8 +259,6 @@ foreach my $package (sort keys %exceptions)
 		$regexp = "^" . $regexp . "\$";
 
 		$existing_override->{regexp} = qr/$regexp/;
-		$existing_override->{other} = $other;
-		$existing_override->{opt_context} = $opt_context;
 
 		push @existing_overrides, $existing_override;
 		$line = <$existing_overrides>;
@@ -321,9 +304,7 @@ foreach my $package (sort keys %exceptions)
 	else
 	{
 	    print $new_override "#\n# DOCUMENT ME\n#\n"
-		. $exception->{prefix} . $exception->{other}
-	    . (defined $exception->{opt_context} ?
-		" " . $exception->{opt_context}:"")
+		. $exception->{prefix}
 	    . "\n"
 		or die "Cannot update $package.tmp\n";
 	}
