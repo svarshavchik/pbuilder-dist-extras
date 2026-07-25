@@ -3,6 +3,7 @@
 use strict;
 use warnings;
 use IO::File;
+use File::Copy;
 
 my $release = shift @ARGV;
 my $cmd = shift @ARGV;
@@ -22,7 +23,26 @@ if (($cmd eq "-switch") || ($cmd eq "-init"))
     $userhome = shift @ARGV
 	or die "Invalid invocation.\n";
 }
-my $result = $userhome . "/pbuilder/${release}_result";
+
+sub result_dir {
+    my ($release) = @_;
+
+    return $userhome . "/pbuilder/${release}_result";
+}
+
+my $AUTO_INSTALL_FILE = "AUTO_INSTALL";
+my $LOCALES_FILE = "LOCALES";
+
+my @ALL_FILES = (
+    {
+	file => $AUTO_INSTALL_FILE,
+	keyword => "use",
+    }, {
+	file => $LOCALES_FILE,
+	keyword => "locale"
+    });
+
+my $result = result_dir($release);
 
 if ($cmd eq 'unhook' || $cmd eq "-unhook")
 {
@@ -244,8 +264,8 @@ EOF
     # does not exist create an empty one. pde-local executes pbuilder-dist
     # with --othermirror pointing to this internal mirror.
     #
-    # The script also reads AUTO_INSTALL, and installs each package there,
-    # reads LOCALES, and installs any locales, and installs a custom
+    # The script also reads $AUTO_INSTALL_FILE, and installs each package there,
+    # reads $LOCALES_FILE, and installs any locales, and installs a custom
     # /etc/apt/preferences, if needed.
 
     my $setup_hook = <<EOF
@@ -259,14 +279,14 @@ then
 	>dists/$release/main/binary-\$DEB_TARGET_ARCH/Packages
 fi
 /usr/bin/apt-get update
-if test -f AUTO_INSTALL
+if test -f $AUTO_INSTALL_FILE
 then
-	/usr/bin/apt-get -y --allow-downgrades install `cat AUTO_INSTALL`
+	/usr/bin/apt-get -y --allow-downgrades install `cat $AUTO_INSTALL_FILE`
 fi
 
-if test -f LOCALES
+if test -f $LOCALES_FILE
 then
-	for locale in `cat LOCALES`
+	for locale in `cat $LOCALES_FILE`
 	do
 		locale-gen \$locale
 	done
@@ -588,7 +608,7 @@ if (system("sudo", $0, $release, "-switch", $ENV{HOME}) != 0)
     exit(1);
 }
 
-# Common logic for updating AUTO_INSTALL and LOCALE lists.
+# Common logic for updating $AUTO_INSTALL_FILE and $LOCALES_FILE lists.
 
 sub update_file {
     my ($f) = @_;
@@ -655,13 +675,56 @@ sub update_file {
 
 if ($cmd eq "use")
 {
-    update_file("AUTO_INSTALL");
+    update_file("$AUTO_INSTALL_FILE");
     exit(0);
 }
 
 if ($cmd eq "locale")
 {
-    update_file("LOCALES");
+    update_file("$LOCALES_FILE");
+    exit(0);
+}
+
+if ($cmd eq "config")
+{
+    foreach my $file (@ALL_FILES)
+    {
+	my @entries;
+
+	if (my $fh = IO::File->new(
+		$result . "/" . $file->{file}, "r"))
+	{
+	    @entries = <$fh>;
+
+	    chomp $_ for @entries;
+	}
+
+	if (@entries)
+	{
+	    print "pde-local ${release} "
+		. join(" ", $file->{keyword}, @entries) . "\n";
+	}
+    }
+    exit(0);
+}
+
+if ($cmd eq "import-from")
+{
+    my $other_release = shift @ARGV
+	or die "Invalid invocation.\n";
+
+    my $src = result_dir($other_release);
+
+    die "Not found: $src.\n" unless -d $src;
+
+    foreach my $file (@ALL_FILES)
+    {
+	$file = $file->{file};
+	next unless -f "$src/$file";
+
+	copy("$src/$file", "$result/$file");
+	print "$other_release/$file copied to $release/$file\n";
+    }
     exit(0);
 }
 
@@ -778,6 +841,14 @@ NOTE: the packages get installed with C<-y --allow-downgrades> flags.
 
 Adds/removes a locale from the buildroot. This requires the "locales"
 package, use C<pde-local [dist] use locales> to add it to the build root.
+
+    pde-local [dist] config
+
+This shows what packages and locales get installed in the buildroot.
+
+    pde-local [dist] import-from [srcdist]
+
+This copies the list of packages and locales from C<[srcdist]> to C<[dist]>.
 
     pde-local [dist] clean
 
