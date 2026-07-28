@@ -9,7 +9,11 @@ pde-local
 
 This is a wrapper for pbuilder-dist that automates the workflow
 of using pbuilder-dist to incrementally build mutually-dependent packages
-that are not a part of a distribution.
+that are not a part of a distribution. The pbuilder root includes a
+repository, and each built package gets added to automatically. This makes
+it easy to bootstrap packages that depend on each other, in a new
+distribution. After all packages get built they get pushed to a real
+aptly repository.
 
 update-overrides
 ----------------

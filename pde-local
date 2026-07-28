@@ -4,6 +4,9 @@ use strict;
 use warnings;
 use IO::File;
 use File::Copy;
+use File::Path qw{ remove_tree };
+use File::Temp qw{ tempdir };
+use Cwd qw{ getcwd };
 
 my $release = shift @ARGV;
 my $cmd = shift @ARGV;
@@ -750,6 +753,121 @@ if ($cmd eq "clean")
     exit(0);
 }
 
+if ($cmd eq "build-as")
+{
+    die "Need a .dsc\n" unless @ARGV;
+
+    my $dsc = shift @ARGV;
+
+    die "Need a new version\n" unless @ARGV;
+
+    my $newver = shift @ARGV;
+
+    die "$dsc: not found.\n" unless -f $dsc;
+
+    my $dsc_fh = IO::File->new($dsc, "r")
+	or die "$dsc: $!\n";
+
+    while (defined ($_=<$dsc_fh>))
+    {
+	last if /^Files:/i;
+    }
+
+    my @FILES = ($dsc);
+
+    $FILES[0] =~ s@(.*)/@@;
+
+    while (defined ($_=<$dsc_fh>))
+    {
+	if (/^\s+[^\s]+\s+[^\s]+\s+([^\s]+)/)
+	{
+	    push @FILES, $1;
+	}
+    }
+
+    my $origdir = getcwd();
+
+    my $dir = File::Temp->newdir(
+	TEMPLATE => "$dsc.tmpXXXXXX"
+	) or die "Cannot create temporary directory.\n";
+
+    $SIG{'INT'} = $SIG{'HUP'} = sub {
+	chdir($origdir);
+	$dir = undef;
+	exit(1);
+    };
+
+    foreach my $filename (@FILES)
+    {
+	my $fullname = $dsc;
+
+	$fullname =~ s@[^/]+$@@ or $fullname="./";
+
+	$fullname .= $filename;
+
+	copy($fullname, "$dir/$filename")
+	    or die "Copy to $fullname to $dir failed: $!\n";
+    }
+
+    system("dpkg-source",
+	"-x",
+	"$dir/$FILES[0]",
+	"$dir/build"
+	) == 0
+	or die "dpkg-source -x failed.\n";
+
+    chdir("$dir/build") or die "Cannot change to $dir/build\n";
+
+    print "Changing to $dir/build\n";
+    my $changelog = IO::File->new("debian/changelog", "r")
+	or die "Cannot read debian/changelog\n";
+
+    my $changelog_line = <$changelog>;
+
+    chomp $changelog_line;
+
+    $changelog_line =~ s@.*\((.*)\).*@$1@;
+
+    print "Current version: $changelog_line\n";
+    unless ($newver =~ /-/)
+    {
+	$changelog_line =~ s/\+.*//;
+	$newver = "${changelog_line}+$newver";
+    }
+
+    print STDERR "New version: $newver\n";
+
+    system("dch", "-v", $newver, "Rebuilt by pde-local for $release") == 0
+	|| do {
+	    chdir($origdir);
+	    die "Could not set version to $newver\n";
+    };
+    system("dpkg-buildpackage", "-S") == 0
+	|| do {
+	    chdir($origdir);
+	    die "Could not build new source package\n";
+    };
+
+    chdir($origdir) or die "Cannot change directory to $origdir\n";
+
+    my ($new_source) = grep { $_ ne "$dir/$FILES[0]"} glob("$dir/*.dsc");
+
+    die "Cannot find new source file\n" unless defined $new_source;
+    print "Running pbuilder-dist in $dir\n";
+    my $pid = fork;
+
+    die "fork: $!\n" unless defined $pid;
+
+    if ($pid)
+    {
+	waitpid($pid, 0);
+	exit($? == 0 ? 0:1);
+    }
+
+    $cmd = "build";
+    unshift @ARGV, $new_source;
+}
+
 my @options;
 
 if ($cmd ne "update")
@@ -856,6 +974,43 @@ The C<clean> command deletes all built deb files from the result directory.
 At this time, the hook that updates the extra source repository does not
 get run, and the repository is in a temporary bad state until the first
 package gets built again.
+
+=head2 BUMPING VERSIONS
+
+    pde-local [dist] build-as sourcepackage.dsc [version] [other parameters]
+
+This is a wrapper for the C<pbuilder-dist [dist] build> command that
+does additional setup work before running the build command: the source
+package gets extracted into a temporary directory, first; then the package
+version gets updated; then a new source package gets created; finally the
+C<build> command builds the package with an altered version.
+
+Building a package with the same exact version in [dist] as the same package
+in the [current-dist] will not allow the package in [current-dist] to get
+updated when the distribution gets updated from [current-dist] and [dist].
+Both packages have the same exact version.
+
+The intent here is to take the [current-dist]'s source package and build it
+for [dist] with a bumped version, so that the package gets updated as part
+of the upgrade from [current-dist] to [dist]. [version] is mandatory, and
+the bumped version gets formed as follows.
+
+If [version] contains a dash, the entire [version] sets the built package's
+version, verbatim. Otherwise:
+
+* Any + in sourcepackage.dsc's full version, and everything that follows
+gets removed from the full version
+
+* A "+" gets appended to the trimmed version, followed by [version]
+
+* A new source package gets created, with the reconstituted version
+
+Subsequently, a "build" command gets executed using the temporary source
+package, which gets removed (but the new source package gets saved in
+C<~/pbuilder/[dist]_results>.
+
+The temporary source package, and the temporary directory gets
+automatically deleted.
 
 =head2 PUSHING TO AN APTLY REPOSITORY
 
